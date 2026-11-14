@@ -15,6 +15,7 @@
 # define MFD_CLOEXEC 0x0001U
 #endif
 # define HASH_SIZE 1024
+# define MAX_UNDEF_SYMS 4096
 
 struct undef_sym {
     Elf64_Sym *sym;
@@ -23,6 +24,9 @@ struct undef_sym {
     int len;
     int next;
 };
+
+static size_t slen(const char *s) { const char *p = s; while (*p) p++; return (size_t)(p - s); }
+static void out(int fd, const char *s) { if (s) write(fd, s, slen(s)); }
 
 static int read_file(const char *path, unsigned char **buf_out, size_t *sz_out, int *mfd_out) {
     int fd, mfd; struct stat st; unsigned char *buf; size_t total = 0; ssize_t rn;
@@ -59,9 +63,16 @@ static void resolve_undef_symbols(unsigned char *buf, size_t mod_sz) {
     }
     if (!syms || !strtab) return;
 
-    struct undef_sym *undefs = __builtin_malloc(num_syms * sizeof(struct undef_sym));
-    if (!undefs) return;
+    int undef_count = 0;
+    for (int i = 0; i < num_syms; i++) {
+        if (syms[i].st_shndx == SHN_UNDEF) {
+            const char *name = strtab + syms[i].st_name;
+            if (*name) undef_count++;
+        }
+    }
+    if (undef_count == 0 || undef_count > MAX_UNDEF_SYMS) return;
 
+    struct undef_sym undefs[MAX_UNDEF_SYMS];
     int head[HASH_SIZE];
     for (int i = 0; i < HASH_SIZE; i++) head[i] = -1;
 
@@ -70,6 +81,7 @@ static void resolve_undef_symbols(unsigned char *buf, size_t mod_sz) {
         if (syms[i].st_shndx == SHN_UNDEF) {
             const char *name = strtab + syms[i].st_name;
             if (!*name) continue;
+            if (count >= MAX_UNDEF_SYMS) break;
             unsigned long h = 5381;
             int len = 0;
             for (const char *s = name; *s; s++) { h = ((h << 5) + h) + (unsigned char)*s; len++; }
@@ -91,8 +103,8 @@ static void resolve_undef_symbols(unsigned char *buf, size_t mod_sz) {
         int fd = open("/proc/kallsyms", O_RDONLY);
         if (fd >= 0) {
             size_t cap = 16 * 1024 * 1024;
-            char *kbuf = __builtin_malloc(cap + 8);
-            if (kbuf) {
+            char *kbuf = mmap(NULL, cap + 8, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (kbuf != MAP_FAILED) {
                 ssize_t n; size_t total = 0;
                 while (total < cap - 1) {
                     n = read(fd, kbuf + total, cap - total - 1);
@@ -111,7 +123,7 @@ static void resolve_undef_symbols(unsigned char *buf, size_t mod_sz) {
                         addr = (addr << 4) | ((c & 0xF) + ((c >> 6) * 9));
                     }
 
-                    if (*ap != ' ') { 
+                    if (*ap != ' ') {
                         while (ap < end_buf && *ap != '\n') ap++;
                         p = ap + 1;
                         continue;
@@ -146,7 +158,7 @@ static void resolve_undef_symbols(unsigned char *buf, size_t mod_sz) {
                     while (ap < end_buf && *ap != '\n') ap++;
                     p = ap + 1;
                 }
-                __builtin_free(kbuf);
+                munmap(kbuf, cap + 8);
             }
             close(fd);
         }
@@ -160,10 +172,9 @@ static void resolve_undef_symbols(unsigned char *buf, size_t mod_sz) {
             close(kptr_fd);
         }
     }
-    __builtin_free(undefs);
 }
 
-static int patch_vermagic(unsigned char *buf, size_t *sz_out, const char *req) {
+static int patch_vermagic(unsigned char *buf, size_t *sz_out, size_t buf_cap, const char *req) {
     Elf64_Ehdr *eh = (Elf64_Ehdr *)buf;
     Elf64_Shdr *sh = (Elf64_Shdr *)(buf + eh->e_shoff), *mod = NULL;
     char *str = (char *)(buf + sh[eh->e_shstrndx].sh_offset);
@@ -182,7 +193,7 @@ static int patch_vermagic(unsigned char *buf, size_t *sz_out, const char *req) {
     unsigned char *new_mod = buf + noff, *old_mod = buf + mod->sh_offset;
 
     size_t len = 0, pos = 0;
-    int rep = 0, req_len = 0;   
+    int rep = 0, req_len = 0;
     while (req[req_len]) req_len++;
 
     while (pos < mod->sh_size) {
@@ -211,6 +222,7 @@ static int patch_vermagic(unsigned char *buf, size_t *sz_out, const char *req) {
         new_mod[len++] = '\0';
     }
 
+    if (noff + len > buf_cap) return 0;
     mod->sh_offset = noff;
     mod->sh_size = len;
     *sz_out = noff + len;
@@ -218,20 +230,27 @@ static int patch_vermagic(unsigned char *buf, size_t *sz_out, const char *req) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) return fprintf(stderr, "Usage: %s <module.ko> [args...]\n", argv[0]), 1;
-    unsigned char *mod_buf; size_t mod_sz, p_len = 0; char params[4096] = {0}; int fd, mfd = -1;
+    if (argc < 2) {
+        out(2, "Usage: ");
+        out(2, argv[0]);
+        out(2, " <module.ko> [args...]\n");
+        return 1;
+    }
+    unsigned char *mod_buf; size_t mod_sz, p_len = 0; char params[1024] = {0}; int fd, mfd = -1;
     if (read_file(argv[1], &mod_buf, &mod_sz, &mfd)) return perror("Failed reading module"), 1;
     size_t map_sz = mod_sz + 4096;
 
     /* SWAR: "\x7fELF\x02\x01\x01\x00" (ELF, 64-bit, Little Endian, Version 1) */
-    if (*(uint64_t *)mod_buf != 0x00010102464c457fULL)
-        return fprintf(stderr, "[-] Invalid or unsupported ELF64 image\n"), 1;
+    if (*(uint64_t *)mod_buf != 0x00010102464c457fULL) {
+        out(2, "[-] Invalid or unsupported ELF64 image\n");
+        return 1;
+    }
 
     for (int i = 2; i < argc; i++) {
         char *arg = argv[i];
         while (*arg && p_len < sizeof(params) - 2) params[p_len++] = *arg++;
-        params[p_len++] = ' ';
-    } 
+        if (p_len < sizeof(params) - 1) params[p_len++] = ' ';
+    }
     params[p_len] = '\0';
 
     resolve_undef_symbols(mod_buf, mod_sz);
@@ -242,11 +261,16 @@ int main(int argc, char **argv) {
 
     while (retries-- > 0) {
         ret = syscall(SYS_init_module, mod_buf, mod_sz, params);
-        if (ret < 0 && (errno == ENOSYS || errno == EPERM)) ret = syscall(SYS_finit_module, mfd, params, 0);
+        if (ret == 0) break;
+        if (ret < 0 && (errno == ENOSYS || errno == EPERM)) {
+            ftruncate(mfd, mod_sz);
+            ret = syscall(SYS_finit_module, mfd, params, 0);
+            if (ret == 0) break;
+        }
         last_err = errno; if (fd < 0) break;
         usleep(50000);
 
-        char kmsg[8192], req_ver[128] = {0};
+        char kmsg[4096], req_ver[128] = {0};
         ssize_t n; int mut = 0;
         while ((n = read(fd, kmsg, sizeof(kmsg) - 1)) > 0 || (n < 0 && errno == EINTR)) {
             if (n <= 0) continue;
@@ -272,8 +296,16 @@ int main(int argc, char **argv) {
         }
 
 apply_patch:
-        if (req_ver[0] && patch_vermagic(mod_buf, &mod_sz, req_ver))
-            printf("[!] Vermagic patched to: '%s'\n", req_ver), mut = 1;
+        if (req_ver[0]) {
+            if (patch_vermagic(mod_buf, &mod_sz, map_sz, req_ver)) {
+                out(1, "[!] Vermagic patched to: '");
+                out(1, req_ver);
+                out(1, "'\n");
+                mut = 1;
+            } else {
+                out(2, "[-] vermagic patch failed (buffer full)\n");
+            }
+        }
 
         if (!mut) break;
     }
@@ -282,6 +314,13 @@ apply_patch:
     close(mfd);
     munmap(mod_buf, map_sz);
 
-    if (!ret) return printf("[+] Loaded: %s\n", argv[1]), 0;
-    errno = last_err; return perror("[-] init_module failed"), 1;
+    if (!ret) {
+        out(1, "[+] Loaded: ");
+        out(1, argv[1]);
+        out(1, "\n");
+        return 0;
+    }
+    errno = last_err;
+    perror("[-] init_module failed");
+    return 1;
 }
